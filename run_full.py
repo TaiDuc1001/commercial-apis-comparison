@@ -10,7 +10,7 @@ def main() -> None:
             models=DEFAULT_MODELS,
             repetitions=1,
             task_limit=None,
-            concurrency=8,
+            concurrency=12,
         )
     )
 
@@ -22,7 +22,7 @@ def rerun_invalid() -> None:
             models=DEFAULT_MODELS,
             repetitions=1,
             task_limit=None,
-            concurrency=8,
+            concurrency=12,
         )
     )
 

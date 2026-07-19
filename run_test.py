@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import hashlib
 import os
 import re
 import time
@@ -89,6 +90,7 @@ def parse_json_object(content: str) -> tuple[dict[str, Any] | None, str | None]:
 
 def normalize_text(value: Any) -> str:
     text = str(value or "").lower()
+    text = re.sub(r"(\d),(\d)", r"\1\2", text)
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
@@ -115,18 +117,18 @@ def answer_matches(expected: str, actual: str) -> bool:
 def valid_schema(parsed: dict[str, Any] | None) -> bool:
     if parsed is None:
         return False
-    if set(parsed) != {"answer", "citations", "confidence"}:
+    if set(parsed) != {"answer", "support_passage_ids", "faithfulness_note"}:
         return False
     if not isinstance(parsed["answer"], str):
         return False
-    citations = parsed["citations"]
+    citations = parsed["support_passage_ids"]
     if not isinstance(citations, list) or not all(isinstance(item, str) for item in citations):
         return False
-    return parsed["confidence"] in {"low", "medium", "high"}
+    return isinstance(parsed["faithfulness_note"], str)
 
 
 def normalize_citation(value: Any) -> str | None:
-    match = re.search(r"\bC\d+\b", str(value or ""))
+    match = re.search(r"\b[a-zA-Z0-9_-]+\b", str(value or ""))
     return match.group(0) if match else None
 
 
@@ -143,7 +145,7 @@ def normalize_parsed_response(parsed: dict[str, Any] | None) -> dict[str, Any] |
     if parsed is None:
         return None
     normalized = dict(parsed)
-    citations = normalized.get("citations")
+    citations = normalized.get("support_passage_ids")
     if isinstance(citations, list):
         normalized["citations"] = normalize_citations(citations)
     return normalized
@@ -156,8 +158,8 @@ def concise(answer: str) -> bool:
 def score_response(task: dict[str, Any], content: str) -> dict[str, Any]:
     parsed, parse_error = parse_json_object(content)
     json_valid = valid_schema(parsed)
-    expected_answer = task["expected_answer"]
-    expected_citations = normalize_citations(task["expected_citations"])
+    expected_answer = task.get("gold_answer") or task.get("expected_answer")
+    expected_citations = normalize_citations(task.get("support_passage_ids") or task.get("expected_citations") or [])
     expected_confidence = task.get("expected_confidence")
 
     if not json_valid:
@@ -172,7 +174,7 @@ def score_response(task: dict[str, Any], content: str) -> dict[str, Any]:
         }
 
     answer = parsed["answer"]
-    citations = normalize_citations(parsed["citations"])
+    citations = normalize_citations(parsed["support_passage_ids"])
     parsed["citations"] = citations
     insufficient = expected_answer == "INSUFFICIENT_INFORMATION"
 
@@ -198,10 +200,12 @@ def score_response(task: dict[str, Any], content: str) -> dict[str, Any]:
 
     answer_correct = answer_matches(expected_answer, answer)
     citation_correct = citations == expected_citations
-    known_citations = set(normalize_citations([chunk["id"] for chunk in task["context_chunks"]]))
+    context_chunks = task.get("context_passages") or task.get("context_chunks") or []
+    chunk_id_key = "passage_id" if "context_passages" in task else "id"
+    known_citations = set(normalize_citations([chunk[chunk_id_key] for chunk in context_chunks]))
     faithful = answer_correct and set(citations).issubset(known_citations)
     clarity = concise(answer)
-    confidence_ok = expected_confidence is None or parsed["confidence"] == expected_confidence
+    confidence_ok = expected_confidence is None or parsed.get("confidence") == expected_confidence
     score = (
         int(answer_correct) * 40
         + int(faithful) * 25
@@ -267,13 +271,48 @@ def extract_usage(response: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def get_prompt(task: dict[str, Any]) -> str:
+    if "prompt" in task:
+        return task["prompt"]
+    context_passages = task.get("context_passages", [])
+    context_str = ""
+    for passage in context_passages:
+        pid = passage["passage_id"]
+        text = passage["text"]
+        context_str += f"[{pid}] {text}\n"
+    question = task["question"]
+    prompt = (
+        f"Context:\n{context_str.strip()}\n\n"
+        f"Question:\n{question}\n\n"
+        "Instruction:\n"
+        "Use only the provided context. Cite all passages that directly support the answer. "
+        "If the answer is not supported by the context, answer exactly \"INSUFFICIENT_INFORMATION\" "
+        "and use an empty citations list. Do not use outside knowledge. "
+        "Return only valid JSON with this schema: "
+        "{\"answer\": string, \"support_passage_ids\": string[], \"faithfulness_note\": string}."
+    )
+    return prompt
+
+
+def task_hash(task: dict[str, Any]) -> str:
+    prompt = get_prompt(task)
+    expected_answer = task.get("gold_answer") or task.get("expected_answer") or ""
+    expected_citations = ",".join(normalize_citations(task.get("support_passage_ids") or task.get("expected_citations") or []))
+    content = f"{prompt}|||{expected_answer}|||{expected_citations}"
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
 def run_single(task: dict[str, Any], model: str, repetition: int, config: RunConfig) -> dict[str, Any]:
     started_at = datetime.now(UTC).isoformat()
     errors: list[str] = []
+    expected_answer = task.get("gold_answer") or task.get("expected_answer")
+    expected_citations = normalize_citations(task.get("support_passage_ids") or task.get("expected_citations") or [])
+    task_type = task.get("scenario_type") or task.get("type", "unknown")
+    difficulty = task.get("difficulty", "medium")
 
     for attempt in range(1, len(config.retry_backoff_seconds) + 2):
         try:
-            response, latency, http_status = send_request(model, task["prompt"], config)
+            response, latency, http_status = send_request(model, get_prompt(task), config)
             content = extract_content(response)
             usage = extract_usage(response)
             scored = score_response(task, content)
@@ -281,8 +320,8 @@ def run_single(task: dict[str, Any], model: str, repetition: int, config: RunCon
             return {
                 "run_id": run_id(repetition, task["task_id"], model),
                 "task_id": task["task_id"],
-                "task_type": task["type"],
-                "difficulty": task["difficulty"],
+                "task_type": task_type,
+                "difficulty": difficulty,
                 "model": model,
                 "repetition": repetition,
                 "status": "success",
@@ -295,8 +334,9 @@ def run_single(task: dict[str, Any], model: str, repetition: int, config: RunCon
                 "cost_usd": usage["cost_usd"],
                 "response": content,
                 "parsed_response": parsed_response,
-                "expected_answer": task["expected_answer"],
-                "expected_citations": normalize_citations(task["expected_citations"]),
+                "expected_answer": expected_answer,
+                "expected_citations": expected_citations,
+                "task_hash": task_hash(task),
                 **scored,
                 "error": None,
             }
@@ -308,8 +348,8 @@ def run_single(task: dict[str, Any], model: str, repetition: int, config: RunCon
     return {
         "run_id": run_id(repetition, task["task_id"], model),
         "task_id": task["task_id"],
-        "task_type": task["type"],
-        "difficulty": task["difficulty"],
+        "task_type": task_type,
+        "difficulty": difficulty,
         "model": model,
         "repetition": repetition,
         "status": "failed",
@@ -322,8 +362,8 @@ def run_single(task: dict[str, Any], model: str, repetition: int, config: RunCon
         "cost_usd": 0.0,
         "response": "",
         "parsed_response": None,
-        "expected_answer": task["expected_answer"],
-        "expected_citations": normalize_citations(task["expected_citations"]),
+        "expected_answer": expected_answer,
+        "expected_citations": expected_citations,
         "score": 0,
         "json_valid": False,
         "answer_correct": False,
@@ -331,6 +371,7 @@ def run_single(task: dict[str, Any], model: str, repetition: int, config: RunCon
         "citation_correct": False,
         "concise": False,
         "parse_error": None,
+        "task_hash": task_hash(task),
         "error": errors[-1] if errors else "unknown error",
     }
 
@@ -402,6 +443,19 @@ def summarize(records: list[dict[str, Any]], config: RunConfig) -> dict[str, Any
 def run_evaluation(config: RunConfig) -> None:
     OUTPUT_DIR.mkdir(exist_ok=True)
     tasks = load_tasks(config.task_limit)
+
+    json_path = OUTPUT_DIR / f"{config.name}.json"
+    existing_records: dict[str, dict[str, Any]] = {}
+    if json_path.exists():
+        try:
+            with json_path.open("r", encoding="utf-8") as file:
+                old_data = json.load(file)
+                for record in old_data.get("records", []):
+                    if record.get("status") == "success":
+                        existing_records[record["run_id"]] = record
+        except Exception:
+            pass
+
     jobs: list[tuple[int, dict[str, Any], str, int]] = []
     records_by_index: dict[int, dict[str, Any]] = {}
     job_index = 0
@@ -409,22 +463,28 @@ def run_evaluation(config: RunConfig) -> None:
     for repetition in range(1, config.repetitions + 1):
         for task in tasks:
             for model in config.models:
-                jobs.append((job_index, task, model, repetition))
+                r_id = run_id(repetition, task["task_id"], model)
+                cached_hash = existing_records.get(r_id, {}).get("task_hash")
+                if r_id in existing_records and (cached_hash is None or cached_hash == task_hash(task)):
+                    records_by_index[job_index] = existing_records[r_id]
+                else:
+                    jobs.append((job_index, task, model, repetition))
                 job_index += 1
 
-    with ThreadPoolExecutor(max_workers=config.concurrency) as executor:
-        futures = {
-            executor.submit(run_single, task, model, repetition, config): index
-            for index, task, model, repetition in jobs
-        }
-        for future in as_completed(futures):
-            index = futures[future]
-            record = future.result()
-            records_by_index[index] = record
-            print(
-                f"{record['run_id']} {record['status']} "
-                f"score={record['score']} cost=${float(record['cost_usd']):.6f}"
-            )
+    if jobs:
+        with ThreadPoolExecutor(max_workers=config.concurrency) as executor:
+            futures = {
+                executor.submit(run_single, task, model, repetition, config): index
+                for index, task, model, repetition in jobs
+            }
+            for future in as_completed(futures):
+                index = futures[future]
+                record = future.result()
+                records_by_index[index] = record
+                print(
+                    f"{record['run_id']} {record['status']} "
+                    f"score={record['score']} cost=${float(record['cost_usd']):.6f}"
+                )
 
     records = [records_by_index[index] for index in sorted(records_by_index)]
     write_outputs(records, config)
@@ -457,11 +517,12 @@ def rescore_records(config: RunConfig) -> None:
     tasks = {task["task_id"]: task for task in load_tasks(config.task_limit)}
     records = []
     for record in data["records"]:
-        scored = score_response(tasks[record["task_id"]], record["response"])
+        task = tasks[record["task_id"]]
+        scored = score_response(task, record["response"])
         parsed = normalize_parsed_response(parse_json_object(record["response"])[0])
         record.update(scored)
         record["parsed_response"] = parsed
-        record["expected_citations"] = normalize_citations(tasks[record["task_id"]]["expected_citations"])
+        record["expected_citations"] = normalize_citations(task.get("support_passage_ids") or task.get("expected_citations") or [])
         records.append(record)
     write_outputs(records, config)
 
@@ -504,9 +565,12 @@ def main() -> None:
     run_evaluation(
         RunConfig(
             name="test_results",
-            models=[CHEAP_TEST_MODEL],
+            models=DEFAULT_MODELS,
             repetitions=1,
             task_limit=5,
+            concurrency=12,
+            timeout_seconds=40.0,
+            retry_backoff_seconds=(2.0, 5.0),
         )
     )
 
